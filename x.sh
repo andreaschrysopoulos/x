@@ -7,6 +7,8 @@
 # Prerequisites:
 #  - Docker installed
 #  - Acme.sh is installed on root
+#
+# Andreas Chrysopoulos
 
 
 set -e
