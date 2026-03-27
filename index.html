@@ -1,0 +1,873 @@
+<!doctype html>
+<html lang="en" class="h-full bg-slate-950">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f766e" />
+  <title>OASTH Live Tracker – 2K</title>
+
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            oasth: {
+              teal: '#0f766e',
+              blue: '#1d4ed8',
+              dark: '#0f172a'
+            }
+          }
+        }
+      }
+    };
+  </script>
+
+  <!-- Leaflet -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+
+  <style>
+    #map {
+      height: calc(100vh - 11rem);
+      min-height: 22rem;
+      width: 100%;
+      border-radius: 1rem;
+    }
+
+    .leaflet-popup-content-wrapper,
+    .leaflet-popup-tip {
+      background: #0f172a;
+      color: #e2e8f0;
+      border: 1px solid #1e293b;
+    }
+
+    .spinner {
+      border: 3px solid rgba(148, 163, 184, 0.2);
+      border-top: 3px solid #14b8a6;
+      border-radius: 999px;
+      width: 1rem;
+      height: 1rem;
+      animation: spin 0.8s linear infinite;
+      display: inline-block;
+      vertical-align: middle;
+      margin-right: .5rem;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body class="h-full bg-slate-950 text-slate-100 antialiased">
+  <div class="min-h-full pb-24">
+    <header class="sticky top-0 z-20 border-b border-slate-800 bg-slate-950/95 backdrop-blur">
+      <div class="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
+        <div>
+          <h1 class="text-lg font-bold text-teal-400">OASTH Live Tracker</h1>
+          <p class="text-xs text-slate-400">Line focus: <span class="font-semibold text-slate-200">2K / 02K</span></p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button id="refreshBtn" class="rounded-lg border border-teal-700/60 bg-teal-700/20 px-3 py-2 text-xs font-medium text-teal-200 hover:bg-teal-700/30">
+            Refresh
+          </button>
+          <span id="sessionState" class="rounded-md border border-slate-700 px-2 py-1 text-[10px] text-slate-300">Session: …</span>
+        </div>
+      </div>
+    </header>
+
+    <main id="app" class="mx-auto max-w-6xl px-4 py-4">
+      <!-- JS-rendered views -->
+    </main>
+
+    <footer class="mx-auto max-w-6xl px-4 pb-24 text-center text-xs text-slate-500">
+      Unofficial app – data from telematics.oasth.gr (not affiliated with OASTH).
+    </footer>
+  </div>
+
+  <nav class="fixed bottom-0 left-0 right-0 z-30 border-t border-slate-800 bg-slate-950/95 backdrop-blur">
+    <div class="mx-auto grid max-w-6xl grid-cols-4 gap-2 p-2 text-xs">
+      <button class="nav-btn rounded-lg px-2 py-3" data-view="home">🏠 Home (2K)</button>
+      <button class="nav-btn rounded-lg px-2 py-3" data-view="map">🗺️ Map</button>
+      <button class="nav-btn rounded-lg px-2 py-3" data-view="arrivals">⏱️ Arrivals</button>
+      <button class="nav-btn rounded-lg px-2 py-3" data-view="lines">🚌 Lines</button>
+    </div>
+  </nav>
+
+  <script>
+    // ------------------------------
+    // Global App State
+    // ------------------------------
+    const API_BASE = 'https://telematics.oasth.gr/api';
+    const SESSION_URL = 'https://telematics.oasth.gr/';
+    const REFRESH_MS = 15000;
+    const MIN_REQUEST_INTERVAL_MS = 10000; // rate-limit: max 1 request per endpoint every 10s
+
+    const state = {
+      activeView: 'home',
+      isLoading: false,
+      errors: [],
+      sessionReady: false,
+      liveBuses: [],
+      lines: [],
+      stops: [],
+      selectedStopCode: '',
+      arrivalsByStop: {},
+      selectedLineCode: '2K',
+      showAllBusesOnMap: false,
+      map: null,
+      markers: new Map(),
+      refreshTimer: null,
+      fetchedOnce: {
+        busLocation: false,
+        lines: false,
+        stops: false,
+        arrivals: false
+      },
+      requestMeta: new Map(), // url -> { lastTs, lastData }
+      mapCenteredOnce: false
+    };
+
+    // ------------------------------
+    // Utility functions
+    // ------------------------------
+    const app = document.getElementById('app');
+    const sessionStateEl = document.getElementById('sessionState');
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    function formatTimestamp(ts) {
+      if (!ts) return '—';
+      const date = new Date(ts);
+      if (!Number.isFinite(date.getTime())) return String(ts);
+      return date.toLocaleString();
+    }
+
+    function toNum(val, fallback = 0) {
+      const n = Number(val);
+      return Number.isFinite(n) ? n : fallback;
+    }
+
+    function routeDirection(bus) {
+      const source = `${bus.LineName || ''} ${bus.Route || ''}`.toLowerCase();
+      if (source.includes('ikea') || source.includes('ικεα')) return 'IKEA';
+      if (source.includes('ktel') || source.includes('κτελ')) return 'KTEL';
+      return bus.Direction || '—';
+    }
+
+    function getBusLatLng(bus) {
+      return [toNum(bus.Lat), toNum(bus.Lon)];
+    }
+
+    function isBusValid(bus) {
+      return Number.isFinite(toNum(bus.Lat, NaN)) && Number.isFinite(toNum(bus.Lon, NaN));
+    }
+
+    function looksLike2K(lineCodeOrName = '') {
+      const s = String(lineCodeOrName).trim().toUpperCase();
+      return ['2K', '02K', '2 Κ', '02 Κ'].some(x => s.includes(x));
+    }
+
+    function filter2K(buses = state.liveBuses) {
+      return buses.filter(b => {
+        return looksLike2K(b.LineCode) || looksLike2K(b.LineName);
+      });
+    }
+
+    function busId(bus) {
+      return String(bus.VehicleCode ?? bus.VehicleID ?? bus.id ?? Math.random());
+    }
+
+    function mapsLink(lat, lon) {
+      return `https://maps.google.com/?q=${encodeURIComponent(lat + ',' + lon)}`;
+    }
+
+    function setError(message) {
+      state.errors.unshift({ at: Date.now(), message });
+      state.errors = state.errors.slice(0, 5);
+      render();
+    }
+
+    function clearErrors() {
+      state.errors = [];
+    }
+
+    function setLoading(flag) {
+      state.isLoading = flag;
+      renderHeaderState();
+    }
+
+    function renderHeaderState() {
+      sessionStateEl.textContent = `Session: ${state.sessionReady ? 'Ready' : 'Pending'}${state.isLoading ? ' • Loading…' : ''}`;
+      sessionStateEl.className = `rounded-md border px-2 py-1 text-[10px] ${
+        state.sessionReady ? 'border-teal-700 text-teal-300' : 'border-amber-700 text-amber-300'
+      }`;
+    }
+
+    async function throttledFetchJson(url) {
+      const now = Date.now();
+      const meta = state.requestMeta.get(url) || { lastTs: 0, lastData: null };
+      const delta = now - meta.lastTs;
+
+      if (delta < MIN_REQUEST_INTERVAL_MS && meta.lastData !== null) {
+        return meta.lastData;
+      }
+
+      const response = await fetch(url, {
+        method: 'GET',
+        credentials: 'include', // IMPORTANT: uses same PHPSESSID session cookie from initSession()
+        headers: { Accept: 'application/json' }
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} from ${url}`);
+      }
+
+      const json = await response.json();
+      state.requestMeta.set(url, { lastTs: now, lastData: json });
+      return json;
+    }
+
+    // ------------------------------
+    // API calls
+    // ------------------------------
+    async function initSession() {
+      // IMPORTANT: This call initializes PHPSESSID cookie required by telematics APIs.
+      await fetch(SESSION_URL, {
+        method: 'GET',
+        credentials: 'include'
+      });
+      state.sessionReady = true;
+      renderHeaderState();
+    }
+
+    async function fetchLiveBuses() {
+      const url = `${API_BASE}/getBusLocation`;
+      const data = await throttledFetchJson(url);
+      if (!state.fetchedOnce.busLocation) {
+        console.log('[OASTH raw] getBusLocation:', data);
+        state.fetchedOnce.busLocation = true;
+      }
+      state.liveBuses = Array.isArray(data) ? data : [];
+      return state.liveBuses;
+    }
+
+    async function fetchLines() {
+      const url = `${API_BASE}/webGetLines`;
+      const data = await throttledFetchJson(url);
+      if (!state.fetchedOnce.lines) {
+        console.log('[OASTH raw] webGetLines:', data);
+        state.fetchedOnce.lines = true;
+      }
+      state.lines = Array.isArray(data) ? data : [];
+      return state.lines;
+    }
+
+    async function fetchStops() {
+      const url = `${API_BASE}/webGetStops`;
+      const data = await throttledFetchJson(url);
+      if (!state.fetchedOnce.stops) {
+        console.log('[OASTH raw] webGetStops:', data);
+        state.fetchedOnce.stops = true;
+      }
+      state.stops = Array.isArray(data) ? data : [];
+      return state.stops;
+    }
+
+    async function fetchArrivals(stopCode) {
+      if (!stopCode) return [];
+      const url = `${API_BASE}/getStopArrivals?stopCode=${encodeURIComponent(stopCode)}`;
+      const data = await throttledFetchJson(url);
+      if (!state.fetchedOnce.arrivals) {
+        console.log('[OASTH raw] getStopArrivals:', data);
+        state.fetchedOnce.arrivals = true;
+      }
+      const arr = Array.isArray(data) ? data : [];
+      state.arrivalsByStop[String(stopCode)] = arr;
+      return arr;
+    }
+
+    async function fetchStopNameAndXY(stopCode) {
+      const url = `${API_BASE}/getStopNameAndXY?stopCode=${encodeURIComponent(stopCode)}`;
+      return throttledFetchJson(url);
+    }
+
+    // ------------------------------
+    // Rendering helpers
+    // ------------------------------
+    function navClass(active) {
+      return active
+        ? 'bg-teal-700/30 text-teal-200 border border-teal-700/60'
+        : 'text-slate-300 border border-transparent hover:bg-slate-800';
+    }
+
+    function card(title, content, extraClass = '') {
+      return `
+        <section class="rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg ${extraClass}">
+          <h2 class="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">${title}</h2>
+          ${content}
+        </section>
+      `;
+    }
+
+    function renderErrorsBlock() {
+      if (!state.errors.length) return '';
+      return `
+        <div class="mb-4 rounded-xl border border-rose-700/50 bg-rose-900/20 p-3 text-sm text-rose-200">
+          <p class="font-semibold">⚠️ Live API notice</p>
+          <ul class="mt-1 list-disc space-y-1 pl-5 text-xs">
+            ${state.errors.slice(0, 2).map(e => `<li>${escapeHtml(e.message)}</li>`).join('')}
+          </ul>
+          <p class="mt-2 text-xs text-rose-300">If this persists: “API changed – contact developer”.</p>
+        </div>
+      `;
+    }
+
+    function renderHomeView() {
+      const buses2K = filter2K();
+      const rows = buses2K.length
+        ? buses2K.map(bus => {
+            const [lat, lon] = getBusLatLng(bus);
+            return `
+              <li class="flex flex-col gap-2 rounded-xl border border-slate-800 bg-slate-950/70 p-3 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <p class="font-semibold text-teal-300">Vehicle #${escapeHtml(bus.VehicleCode || '—')}</p>
+                  <p class="text-xs text-slate-300">Speed: ${escapeHtml(bus.Speed ?? '0')} km/h • Last update: ${escapeHtml(formatTimestamp(bus.Time))}</p>
+                </div>
+                <div class="flex gap-2">
+                  <button data-action="center-bus" data-vehicle="${escapeHtml(bus.VehicleCode || '')}" class="rounded-lg border border-blue-700/60 px-2 py-1 text-xs text-blue-200 hover:bg-blue-800/30">Center map</button>
+                  <a target="_blank" rel="noreferrer" href="${mapsLink(lat, lon)}" class="rounded-lg border border-slate-700 px-2 py-1 text-xs text-slate-200 hover:bg-slate-800">Google Maps</a>
+                </div>
+              </li>
+            `;
+          }).join('')
+        : '<li class="rounded-xl border border-slate-800 bg-slate-950/70 p-3 text-sm text-slate-300">No 2K buses running right now.</li>';
+
+      return `
+        <div class="space-y-4">
+          ${renderErrorsBlock()}
+
+          ${card('2K Dashboard', `
+            <div class="flex items-center justify-between rounded-xl bg-gradient-to-r from-teal-700/30 to-blue-700/20 p-4">
+              <div>
+                <p class="text-xs uppercase tracking-wide text-slate-300">2K Live Buses</p>
+                <p class="text-4xl font-black text-teal-300">${buses2K.length}</p>
+              </div>
+              <div class="text-right text-xs text-slate-300">
+                <p>Auto refresh: ${REFRESH_MS / 1000}s</p>
+                <p>Rate limit: 1 call / 10s</p>
+              </div>
+            </div>
+          `)}
+
+          ${card('Active 2K Vehicles', `<ul class="space-y-2">${rows}</ul>`)}
+        </div>
+      `;
+    }
+
+    function createBusIcon(rotation = 0) {
+      return L.divIcon({
+        className: 'bus-icon',
+        html: `<div style="transform: rotate(${rotation}deg); font-size: 22px; line-height: 1;">🚌</div>`,
+        iconSize: [24, 24],
+        iconAnchor: [12, 12]
+      });
+    }
+
+    function ensureMap() {
+      if (state.map) return;
+      state.map = L.map('map', { zoomControl: true }).setView([40.6401, 22.9444], 12);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors'
+      }).addTo(state.map);
+    }
+
+    function busesToDisplayOnMap() {
+      return state.showAllBusesOnMap ? state.liveBuses : filter2K();
+    }
+
+    function renderMapMarkers() {
+      if (!state.map) return;
+
+      const buses = busesToDisplayOnMap().filter(isBusValid);
+      const keep = new Set();
+
+      buses.forEach(bus => {
+        const id = busId(bus);
+        keep.add(id);
+        const [lat, lon] = getBusLatLng(bus);
+        const heading = toNum(bus.Heading || bus.Bearing || 0);
+        const popupHtml = `
+          <div class="text-xs">
+            <p><strong>Vehicle:</strong> ${escapeHtml(bus.VehicleCode || '—')}</p>
+            <p><strong>Speed:</strong> ${escapeHtml(bus.Speed || 0)} km/h</p>
+            <p><strong>Direction:</strong> ${escapeHtml(routeDirection(bus))}</p>
+            <p><strong>Line:</strong> ${escapeHtml(bus.LineCode || bus.LineName || '—')}</p>
+          </div>
+        `;
+
+        if (!state.markers.has(id)) {
+          const marker = L.marker([lat, lon], { icon: createBusIcon(heading) }).addTo(state.map);
+          marker.bindPopup(popupHtml);
+          state.markers.set(id, marker);
+        } else {
+          const marker = state.markers.get(id);
+          marker.setLatLng([lat, lon]);
+          marker.setIcon(createBusIcon(heading));
+          marker.setPopupContent(popupHtml);
+        }
+      });
+
+      [...state.markers.keys()].forEach(id => {
+        if (!keep.has(id)) {
+          state.map.removeLayer(state.markers.get(id));
+          state.markers.delete(id);
+        }
+      });
+
+      if (!state.mapCenteredOnce && buses.length) {
+        const bounds = L.latLngBounds(buses.map(getBusLatLng));
+        state.map.fitBounds(bounds.pad(0.2));
+        state.mapCenteredOnce = true;
+      }
+    }
+
+    function renderMapView() {
+      return `
+        <div class="space-y-4">
+          ${renderErrorsBlock()}
+          <div class="flex flex-wrap items-center gap-2">
+            <button data-action="toggle-map-filter" class="rounded-lg border border-teal-700/60 bg-teal-700/20 px-3 py-2 text-xs text-teal-200 hover:bg-teal-700/30">
+              ${state.showAllBusesOnMap ? 'Only 2K' : 'Show all OASTH buses'}
+            </button>
+            <span class="text-xs text-slate-300">Showing: ${state.showAllBusesOnMap ? 'All buses' : '2K buses only'} (${busesToDisplayOnMap().length})</span>
+          </div>
+          <div id="map" class="border border-slate-800 bg-slate-900"></div>
+        </div>
+      `;
+    }
+
+    function stopCandidateName(stop) {
+      return stop.StopName || stop.Name || stop.stopName || 'Unknown stop';
+    }
+
+    function stopCandidateCode(stop) {
+      return String(stop.StopCode || stop.Code || stop.stopCode || '');
+    }
+
+    function renderArrivalsTable(arrivals) {
+      if (!arrivals || !arrivals.length) {
+        return '<p class="text-sm text-slate-300">No live arrivals right now for this stop.</p>';
+      }
+      return `
+        <ul class="space-y-2">
+          ${arrivals.map(a => `
+            <li class="rounded-xl border border-slate-800 bg-slate-950/70 p-3 text-sm">
+              <p class="font-semibold text-teal-300">${escapeHtml(a.LineCode || a.Line || 'Bus')} → ${escapeHtml(a.Destination || a.Route || '—')}</p>
+              <p class="text-xs text-slate-300">ETA: ${escapeHtml(a.btime2 || a.Minutes || a.Estimated || '—')} min</p>
+            </li>
+          `).join('')}
+        </ul>
+      `;
+    }
+
+    function renderArrivalsView() {
+      const q = (state.arrivalsQuery || '').trim().toLowerCase();
+      const matches = state.stops
+        .filter(s => {
+          const name = stopCandidateName(s).toLowerCase();
+          const code = stopCandidateCode(s).toLowerCase();
+          return !q || name.includes(q) || code.includes(q);
+        })
+        .slice(0, 30);
+
+      const popular = state.stops.filter(s => {
+        const name = stopCandidateName(s).toLowerCase();
+        return name.includes('ikea') || name.includes('κτελ') || name.includes('ktel');
+      }).slice(0, 6);
+
+      const selectedArrivals = state.arrivalsByStop[state.selectedStopCode] || [];
+
+      return `
+        <div class="space-y-4">
+          ${renderErrorsBlock()}
+
+          ${card('Real-time Arrivals', `
+            <div class="space-y-3">
+              <input id="arrivalsSearch" value="${escapeHtml(state.arrivalsQuery || '')}" placeholder="Search stop name or code" class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-teal-500" />
+              <div class="flex flex-wrap gap-2">
+                ${(popular.length ? popular : matches.slice(0, 4)).map(s => `
+                  <button data-action="select-stop" data-stop-code="${escapeHtml(stopCandidateCode(s))}" class="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-200 hover:bg-slate-800">
+                    ${escapeHtml(stopCandidateName(s))}
+                  </button>
+                `).join('')}
+              </div>
+              <div class="grid gap-2 md:grid-cols-2">
+                ${matches.slice(0, 12).map(s => `
+                  <button data-action="select-stop" data-stop-code="${escapeHtml(stopCandidateCode(s))}" class="rounded-xl border border-slate-800 bg-slate-950/70 p-2 text-left hover:bg-slate-800/60">
+                    <p class="text-sm font-medium text-slate-100">${escapeHtml(stopCandidateName(s))}</p>
+                    <p class="text-xs text-slate-400">Code: ${escapeHtml(stopCandidateCode(s))}</p>
+                  </button>
+                `).join('')}
+              </div>
+            </div>
+          `)}
+
+          ${card(`Arrivals for stop ${escapeHtml(state.selectedStopCode || '—')}`, renderArrivalsTable(selectedArrivals))}
+        </div>
+      `;
+    }
+
+    function normalizeLine(line) {
+      const code = String(line.LineCode || line.code || line.Code || line.LineID || '');
+      const name = String(line.LineName || line.Name || line.Description || '');
+      return { ...line, _code: code, _name: name };
+    }
+
+    function renderLinesView() {
+      const query = (state.linesQuery || '').toLowerCase();
+      const lines = state.lines.map(normalizeLine).filter(l => !query || l._code.toLowerCase().includes(query) || l._name.toLowerCase().includes(query));
+      const selected = lines.find(l => l._code === state.selectedLineCode) || lines.find(l => looksLike2K(l._code) || looksLike2K(l._name));
+
+      const stopsForLine = state.stops.filter(s => {
+        const lineField = String(s.LineCode || s.Line || s.Route || '');
+        return selected && lineField && (lineField.includes(selected._code) || lineField.includes(selected._name));
+      }).slice(0, 80);
+
+      return `
+        <div class="space-y-4">
+          ${renderErrorsBlock()}
+
+          ${card('Lines Browser', `
+            <div class="space-y-3">
+              <input id="linesSearch" value="${escapeHtml(state.linesQuery || '')}" placeholder="Search all lines" class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-teal-500" />
+              <div class="grid max-h-64 gap-2 overflow-auto pr-1 md:grid-cols-2">
+                ${lines.slice(0, 200).map(line => `
+                  <button data-action="select-line" data-line-code="${escapeHtml(line._code)}" class="rounded-xl border ${state.selectedLineCode === line._code ? 'border-teal-600 bg-teal-800/20' : 'border-slate-800 bg-slate-950/70'} p-3 text-left hover:bg-slate-800/60">
+                    <p class="font-semibold text-teal-300">${escapeHtml(line._code || '—')}</p>
+                    <p class="text-xs text-slate-300">${escapeHtml(line._name || 'No line name')}</p>
+                  </button>
+                `).join('')}
+              </div>
+            </div>
+          `)}
+
+          ${card(`Line details: ${escapeHtml(selected?._code || '—')}`, `
+            <div class="space-y-3 text-sm">
+              <p><span class="text-slate-400">Route name:</span> ${escapeHtml(selected?._name || '—')}</p>
+              <div class="flex flex-wrap gap-2">
+                <button data-action="line-jump-2k" class="rounded-lg border border-blue-700/60 px-3 py-1 text-xs text-blue-200 hover:bg-blue-800/30">Go to 2K dashboard</button>
+                <button data-action="line-show-map" data-line-code="${escapeHtml(selected?._code || '')}" class="rounded-lg border border-teal-700/60 px-3 py-1 text-xs text-teal-200 hover:bg-teal-800/30">Show live buses on map</button>
+              </div>
+              <p class="text-xs text-slate-400">Stops (best effort from webGetStops):</p>
+              <ul class="max-h-48 space-y-1 overflow-auto rounded-lg border border-slate-800 bg-slate-950/70 p-2 text-xs">
+                ${(stopsForLine.length ? stopsForLine : state.stops.slice(0, 30)).map(s => `
+                  <li>${escapeHtml(stopCandidateCode(s))} — ${escapeHtml(stopCandidateName(s))}</li>
+                `).join('')}
+              </ul>
+            </div>
+          `)}
+
+          ${card('Stop Search', `
+            <div class="space-y-2">
+              <div class="flex gap-2">
+                <input id="stopLookupInput" value="${escapeHtml(state.stopLookup || '')}" placeholder="Type stop code or name" class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-teal-500" />
+                <button data-action="stop-lookup" class="rounded-xl border border-slate-700 px-3 py-2 text-xs hover:bg-slate-800">Lookup</button>
+              </div>
+              <div id="stopLookupResult" class="text-xs text-slate-300">${escapeHtml(state.stopLookupResult || '')}</div>
+            </div>
+          `)}
+        </div>
+      `;
+    }
+
+    function render() {
+      document.querySelectorAll('.nav-btn').forEach(btn => {
+        btn.className = `nav-btn rounded-lg px-2 py-3 ${navClass(btn.dataset.view === state.activeView)}`;
+      });
+
+      const loadingBlock = state.isLoading
+        ? '<div class="mb-3 text-xs text-slate-300"><span class="spinner"></span>Loading live data…</div>'
+        : '';
+
+      if (state.activeView === 'home') {
+        app.innerHTML = loadingBlock + renderHomeView();
+      } else if (state.activeView === 'map') {
+        app.innerHTML = loadingBlock + renderMapView();
+        ensureMap();
+        renderMapMarkers();
+      } else if (state.activeView === 'arrivals') {
+        app.innerHTML = loadingBlock + renderArrivalsView();
+      } else if (state.activeView === 'lines') {
+        app.innerHTML = loadingBlock + renderLinesView();
+      }
+
+      bindDynamicHandlers();
+    }
+
+    function centerMapOnBus(vehicleCode) {
+      const bus = state.liveBuses.find(b => String(b.VehicleCode) === String(vehicleCode));
+      if (!bus || !isBusValid(bus)) return;
+      state.activeView = 'map';
+      render();
+      const latLng = getBusLatLng(bus);
+      state.map.setView(latLng, 15);
+      const marker = state.markers.get(busId(bus));
+      if (marker) marker.openPopup();
+    }
+
+    function bindDynamicHandlers() {
+      document.querySelectorAll('[data-action="center-bus"]').forEach(btn => {
+        btn.onclick = () => centerMapOnBus(btn.dataset.vehicle);
+      });
+
+      const toggleMapBtn = document.querySelector('[data-action="toggle-map-filter"]');
+      if (toggleMapBtn) {
+        toggleMapBtn.onclick = () => {
+          state.showAllBusesOnMap = !state.showAllBusesOnMap;
+          render();
+        };
+      }
+
+      document.querySelectorAll('[data-action="select-stop"]').forEach(btn => {
+        btn.onclick = async () => {
+          const code = btn.dataset.stopCode;
+          state.selectedStopCode = code;
+          render();
+          try {
+            setLoading(true);
+            await fetchArrivals(code);
+            setLoading(false);
+            render();
+          } catch (e) {
+            setLoading(false);
+            setError(`Arrivals failed for stop ${code}: ${e.message}`);
+          }
+        };
+      });
+
+      const arrivalsSearch = document.getElementById('arrivalsSearch');
+      if (arrivalsSearch) {
+        arrivalsSearch.oninput = (e) => {
+          state.arrivalsQuery = e.target.value;
+          render();
+        };
+      }
+
+      const linesSearch = document.getElementById('linesSearch');
+      if (linesSearch) {
+        linesSearch.oninput = (e) => {
+          state.linesQuery = e.target.value;
+          render();
+        };
+      }
+
+      document.querySelectorAll('[data-action="select-line"]').forEach(btn => {
+        btn.onclick = () => {
+          state.selectedLineCode = btn.dataset.lineCode;
+          render();
+        };
+      });
+
+      const jumpBtn = document.querySelector('[data-action="line-jump-2k"]');
+      if (jumpBtn) {
+        jumpBtn.onclick = () => {
+          state.activeView = 'home';
+          render();
+        };
+      }
+
+      const lineMapBtn = document.querySelector('[data-action="line-show-map"]');
+      if (lineMapBtn) {
+        lineMapBtn.onclick = () => {
+          const code = lineMapBtn.dataset.lineCode;
+          state.showAllBusesOnMap = true;
+          state.activeView = 'map';
+          render();
+
+          const lineBuses = state.liveBuses.filter(b => String(b.LineCode || '').toUpperCase().includes(String(code || '').toUpperCase()));
+          if (state.map && lineBuses.length) {
+            const bounds = L.latLngBounds(lineBuses.filter(isBusValid).map(getBusLatLng));
+            if (bounds.isValid()) state.map.fitBounds(bounds.pad(0.2));
+          }
+        };
+      }
+
+      const stopLookupBtn = document.querySelector('[data-action="stop-lookup"]');
+      const stopLookupInput = document.getElementById('stopLookupInput');
+      if (stopLookupBtn && stopLookupInput) {
+        const runLookup = async () => {
+          const q = stopLookupInput.value.trim();
+          state.stopLookup = q;
+          if (!q) {
+            state.stopLookupResult = '';
+            render();
+            return;
+          }
+
+          try {
+            setLoading(true);
+            const localMatch = state.stops.find(s => stopCandidateCode(s) === q || stopCandidateName(s).toLowerCase().includes(q.toLowerCase()));
+            const code = localMatch ? stopCandidateCode(localMatch) : q;
+            const details = await fetchStopNameAndXY(code);
+            const arrivals = await fetchArrivals(code);
+            setLoading(false);
+            const d = Array.isArray(details) ? details[0] : details;
+            const lat = d?.Lat ?? d?.lat ?? '—';
+            const lon = d?.Lon ?? d?.lon ?? '—';
+            state.stopLookupResult = `${d?.StopName || d?.Name || stopCandidateName(localMatch || {}) || 'Unknown stop'} (${code}) | Lat: ${lat}, Lon: ${lon} | Arrivals: ${arrivals.length}`;
+            state.selectedStopCode = code;
+            render();
+          } catch (e) {
+            setLoading(false);
+            setError(`Stop lookup failed: ${e.message}`);
+          }
+        };
+
+        stopLookupBtn.onclick = runLookup;
+        stopLookupInput.onkeydown = (e) => {
+          if (e.key === 'Enter') runLookup();
+        };
+      }
+    }
+
+    // ------------------------------
+    // Data refresh orchestration
+    // ------------------------------
+    async function refreshCoreData() {
+      try {
+        setLoading(true);
+        clearErrors();
+        await fetchLiveBuses();
+        await Promise.all([
+          state.lines.length ? Promise.resolve() : fetchLines(),
+          state.stops.length ? Promise.resolve() : fetchStops()
+        ]);
+
+        if (state.selectedStopCode) {
+          fetchArrivals(state.selectedStopCode).catch(() => {});
+        }
+      } catch (e) {
+        setError(`Live refresh failed: ${e.message}`);
+      } finally {
+        setLoading(false);
+        render();
+        if (state.activeView === 'map') renderMapMarkers();
+      }
+    }
+
+    function startAutoRefresh() {
+      if (state.refreshTimer) clearInterval(state.refreshTimer);
+      state.refreshTimer = setInterval(refreshCoreData, REFRESH_MS);
+    }
+
+    // ------------------------------
+    // PWA bits (manifest + service worker stub)
+    // ------------------------------
+    function setupPWA() {
+      const svgIcon = encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="88" fill="#0f766e"/><text x="50%" y="55%" dominant-baseline="middle" text-anchor="middle" font-size="270">🚌</text></svg>');
+      const iconUrl = `data:image/svg+xml,${svgIcon}`;
+
+      const manifest = {
+        name: 'OASTH Live Tracker',
+        short_name: 'OASTH 2K',
+        display: 'standalone',
+        start_url: '.',
+        scope: '.',
+        background_color: '#020617',
+        theme_color: '#0f766e',
+        description: 'Unofficial OASTH tracker for line 2K and live arrivals.',
+        icons: [
+          { src: iconUrl, sizes: '192x192', type: 'image/svg+xml' },
+          { src: iconUrl, sizes: '512x512', type: 'image/svg+xml' }
+        ]
+      };
+
+      const manifestBlob = new Blob([JSON.stringify(manifest)], { type: 'application/manifest+json' });
+      const manifestUrl = URL.createObjectURL(manifestBlob);
+      const link = document.createElement('link');
+      link.rel = 'manifest';
+      link.href = manifestUrl;
+      document.head.appendChild(link);
+
+      if ('serviceWorker' in navigator && window.isSecureContext) {
+        const swCode = `
+          self.addEventListener('install', event => { self.skipWaiting(); });
+          self.addEventListener('activate', event => { event.waitUntil(self.clients.claim()); });
+          self.addEventListener('fetch', () => {});
+        `;
+        const swBlob = new Blob([swCode], { type: 'text/javascript' });
+        const swUrl = URL.createObjectURL(swBlob);
+        navigator.serviceWorker.register(swUrl).catch(err => {
+          console.warn('SW registration failed:', err);
+        });
+      } else {
+        console.info('PWA install limited: service worker needs HTTPS (or localhost).');
+      }
+    }
+
+    // ------------------------------
+    // App bootstrap
+    // ------------------------------
+    function bindStaticHandlers() {
+      document.querySelectorAll('.nav-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          state.activeView = btn.dataset.view;
+          render();
+          if (state.activeView === 'map') {
+            setTimeout(() => {
+              if (state.map) {
+                state.map.invalidateSize();
+                renderMapMarkers();
+              }
+            }, 30);
+          }
+        });
+      });
+
+      document.getElementById('refreshBtn').addEventListener('click', () => {
+        refreshCoreData();
+      });
+    }
+
+    async function bootstrap() {
+      renderHeaderState();
+      bindStaticHandlers();
+      render();
+
+      try {
+        setLoading(true);
+        await initSession();
+        await refreshCoreData();
+        startAutoRefresh();
+      } catch (e) {
+        setError(`Startup failed: ${e.message}`);
+      } finally {
+        setLoading(false);
+      }
+
+      setupPWA();
+    }
+
+    bootstrap();
+  </script>
+</body>
+</html>
